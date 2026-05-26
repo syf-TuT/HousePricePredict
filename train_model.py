@@ -1,12 +1,13 @@
 import argparse
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.compose import ColumnTransformer, TransformedTargetRegressor
 from sklearn.impute import SimpleImputer
+from sklearn.linear_model import RidgeCV
 from sklearn.metrics import mean_squared_log_error
 from sklearn.model_selection import KFold
 from sklearn.pipeline import Pipeline
@@ -176,6 +177,22 @@ def build_model(
     )
 
 
+def build_ridge_model(
+    train: pd.DataFrame, test: pd.DataFrame
+) -> TransformedTargetRegressor:
+    regressor = Pipeline(
+        steps=[
+            ("preprocessor", build_preprocessor(train, test)),
+            ("model", RidgeCV(alphas=[0.1, 1.0, 3.0, 10.0, 30.0])),
+        ]
+    )
+    return TransformedTargetRegressor(
+        regressor=regressor,
+        func=np.log1p,
+        inverse_func=np.expm1,
+    )
+
+
 def use_cpu_model(
     estimator: TransformedTargetRegressor,
 ) -> TransformedTargetRegressor:
@@ -188,9 +205,28 @@ def split_features_target(train: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]
     return train.drop(columns=["SalePrice"]), train["SalePrice"]
 
 
+def filter_training_outliers(train: pd.DataFrame) -> pd.DataFrame:
+    required_columns = {"GrLivArea", "SalePrice"}
+    if not required_columns.issubset(train.columns):
+        return train.copy()
+
+    outlier_mask = (train["GrLivArea"] > 4000) & (train["SalePrice"] < 300000)
+    return train.loc[~outlier_mask].copy()
+
+
 def rmsle(y_true: Iterable[float], y_pred: Iterable[float]) -> float:
     clipped = np.maximum(np.asarray(y_pred), 0)
     return float(np.sqrt(mean_squared_log_error(y_true, clipped)))
+
+
+def blend_predictions(
+    xgb_predictions: Iterable[float],
+    ridge_predictions: Iterable[float],
+    xgb_weight: float,
+) -> np.ndarray:
+    xgb_values = np.asarray(xgb_predictions, dtype=float)
+    ridge_values = np.asarray(ridge_predictions, dtype=float)
+    return xgb_weight * xgb_values + (1 - xgb_weight) * ridge_values
 
 
 def cross_validate_rmsle(
@@ -218,6 +254,85 @@ def cross_validate_rmsle(
     return scores
 
 
+def cross_validate_blend(
+    xgb_estimator: TransformedTargetRegressor,
+    ridge_estimator: TransformedTargetRegressor,
+    train: pd.DataFrame,
+    folds: int = 5,
+    weights: Sequence[float] = (1.0, 0.9, 0.8, 0.7, 0.6),
+    allow_cpu_fallback: bool = True,
+) -> Tuple[float, Dict[float, List[float]], Dict[float, pd.Series]]:
+    x, y = split_features_target(train)
+    cv = KFold(n_splits=folds, shuffle=True, random_state=RANDOM_STATE)
+    scores_by_weight = {weight: [] for weight in weights}
+    oof_predictions_by_weight = {
+        weight: pd.Series(index=train.index, dtype=float) for weight in weights
+    }
+
+    for train_index, validation_index in cv.split(x):
+        validation_labels = y.iloc[validation_index]
+        validation_index_values = x.iloc[validation_index].index
+        fold_xgb = clone(xgb_estimator)
+        fold_ridge = clone(ridge_estimator)
+
+        try:
+            fold_xgb.fit(x.iloc[train_index], y.iloc[train_index])
+        except XGBoostError:
+            if not allow_cpu_fallback:
+                raise
+            fold_xgb = use_cpu_model(fold_xgb)
+            fold_xgb.fit(x.iloc[train_index], y.iloc[train_index])
+
+        fold_ridge.fit(x.iloc[train_index], y.iloc[train_index])
+
+        xgb_predictions = fold_xgb.predict(x.iloc[validation_index])
+        ridge_predictions = fold_ridge.predict(x.iloc[validation_index])
+
+        for weight in weights:
+            blended = blend_predictions(xgb_predictions, ridge_predictions, weight)
+            scores_by_weight[weight].append(rmsle(validation_labels, blended))
+            oof_predictions_by_weight[weight].loc[validation_index_values] = blended
+
+    best_weight = min(
+        scores_by_weight,
+        key=lambda weight: float(np.mean(scores_by_weight[weight])),
+    )
+    return best_weight, scores_by_weight, oof_predictions_by_weight
+
+
+def build_error_analysis(
+    train: pd.DataFrame, predictions: Iterable[float]
+) -> pd.DataFrame:
+    engineered = FeatureEngineer().fit_transform(train)
+    prediction_values = np.maximum(np.asarray(predictions, dtype=float), 0)
+
+    report = pd.DataFrame(
+        {
+            "Id": train["Id"].astype(int) if "Id" in train.columns else train.index,
+            "SalePrice": train["SalePrice"].to_numpy(dtype=float),
+            "Prediction": prediction_values,
+            "AbsLogError": np.abs(
+                np.log1p(train["SalePrice"].to_numpy(dtype=float))
+                - np.log1p(prediction_values)
+            ),
+        },
+        index=train.index,
+    )
+    diagnostic_columns = [
+        "GrLivArea",
+        "TotalSF",
+        "OverallQual",
+        "Neighborhood",
+        "YearBuilt",
+        "GarageArea",
+    ]
+    for column in diagnostic_columns:
+        if column in engineered.columns:
+            report[column] = engineered[column]
+
+    return report.sort_values("AbsLogError", ascending=False).reset_index(drop=True)
+
+
 def save_submission(
     test: pd.DataFrame,
     predictions: Iterable[float],
@@ -233,28 +348,70 @@ def save_submission(
 
 
 def train_and_predict(
-    data_dir: Path, output_path: Path, device: str = "auto", folds: int = 5
+    data_dir: Path,
+    output_path: Path,
+    device: str = "auto",
+    folds: int = 5,
+    blend_weights: Sequence[float] = (1.0, 0.9, 0.8, 0.7, 0.6),
+    error_analysis_output: Optional[Path] = None,
+    remove_outliers: bool = False,
 ) -> None:
     train = pd.read_csv(data_dir / "train.csv")
     test = pd.read_csv(data_dir / "test.csv")
+    if remove_outliers:
+        original_count = len(train)
+        train = filter_training_outliers(train)
+        print(f"Removed {original_count - len(train)} training outliers")
 
-    model = build_model(train, test, device=device)
-    scores = cross_validate_rmsle(model, train, folds=folds)
-    print(
-        "CV RMSLE: "
-        f"{np.mean(scores):.5f} +/- {np.std(scores):.5f} "
-        f"folds={', '.join(f'{score:.5f}' for score in scores)}"
+    xgb_model = build_model(train, test, device=device)
+    ridge_model = build_ridge_model(train, test)
+    best_weight, scores_by_weight, oof_predictions_by_weight = cross_validate_blend(
+        xgb_model,
+        ridge_model,
+        train,
+        folds=folds,
+        weights=blend_weights,
     )
+    print("Blend CV RMSLE:")
+    for weight, scores in scores_by_weight.items():
+        print(
+            f"xgb_weight={weight:.2f}: "
+            f"{np.mean(scores):.5f} +/- {np.std(scores):.5f} "
+            f"folds={', '.join(f'{score:.5f}' for score in scores)}"
+        )
+    print(f"Best xgb_weight={best_weight:.2f}")
+    if error_analysis_output is not None:
+        error_report = build_error_analysis(
+            train,
+            oof_predictions_by_weight[best_weight].reindex(train.index).to_numpy(),
+        )
+        error_report.to_csv(error_analysis_output, index=False)
+        print(f"Wrote {error_analysis_output}")
 
     x, y = split_features_target(train)
     try:
-        model.fit(x, y)
+        xgb_model.fit(x, y)
     except XGBoostError:
-        model = use_cpu_model(model)
-        model.fit(x, y)
-    predictions = model.predict(test)
+        xgb_model = use_cpu_model(xgb_model)
+        xgb_model.fit(x, y)
+    ridge_model.fit(x, y)
+    predictions = blend_predictions(
+        xgb_model.predict(test),
+        ridge_model.predict(test),
+        xgb_weight=best_weight,
+    )
     save_submission(test, predictions, output_path)
     print(f"Wrote {output_path}")
+
+
+def parse_blend_weights(value: str) -> List[float]:
+    weights = [float(item.strip()) for item in value.split(",") if item.strip()]
+    if not weights:
+        raise argparse.ArgumentTypeError("At least one blend weight is required.")
+    invalid_weights = [weight for weight in weights if weight < 0 or weight > 1]
+    if invalid_weights:
+        raise argparse.ArgumentTypeError("Blend weights must be between 0 and 1.")
+    return weights
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -285,9 +442,34 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         default=5,
         help="Number of cross-validation folds.",
     )
+    parser.add_argument(
+        "--blend-weights",
+        type=parse_blend_weights,
+        default=[1.0, 0.9, 0.8, 0.7, 0.6],
+        help="Comma-separated XGBoost weights to compare for XGB/Ridge blending.",
+    )
+    parser.add_argument(
+        "--error-analysis-output",
+        type=Path,
+        default=Path("error_analysis.csv"),
+        help="Path for the OOF validation error report.",
+    )
+    parser.add_argument(
+        "--remove-outliers",
+        action="store_true",
+        help="Remove classic high-area, low-price Ames outliers before training.",
+    )
     return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
     args = parse_args()
-    train_and_predict(args.data_dir, args.output, device=args.device, folds=args.folds)
+    train_and_predict(
+        args.data_dir,
+        args.output,
+        device=args.device,
+        folds=args.folds,
+        blend_weights=args.blend_weights,
+        error_analysis_output=args.error_analysis_output,
+        remove_outliers=args.remove_outliers,
+    )

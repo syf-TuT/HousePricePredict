@@ -4,9 +4,13 @@ import pandas as pd
 
 from train_model import (
     FeatureEngineer,
+    blend_predictions,
+    build_error_analysis,
     build_model,
     build_preprocessor,
+    build_ridge_model,
     build_xgb_model,
+    filter_training_outliers,
     parse_args,
     save_submission,
 )
@@ -113,11 +117,90 @@ def test_build_model_uses_requested_xgboost_device():
     assert xgb_model.get_params()["tree_method"] == "hist"
 
 
+def test_build_ridge_model_uses_ridgecv():
+    train = pd.DataFrame(
+        {
+            "Id": [1, 2, 3, 4],
+            "LotArea": [8450, 9600, 11250, 9550],
+            "MSZoning": ["RL", "RL", "RM", "FV"],
+            "SalePrice": [208500, 181500, 223500, 140000],
+        }
+    )
+    test = pd.DataFrame(
+        {
+            "Id": [5],
+            "LotArea": [10000],
+            "MSZoning": ["RL"],
+        }
+    )
+
+    model = build_ridge_model(train, test)
+
+    assert model.regressor.named_steps["model"].__class__.__name__ == "RidgeCV"
+
+
+def test_blend_predictions_uses_xgb_weight():
+    blended = blend_predictions([100, 200], [80, 220], xgb_weight=0.75)
+
+    assert blended.tolist() == [95.0, 205.0]
+
+
 def test_parse_args_supports_device_and_folds():
     args = parse_args(["--device", "cpu", "--folds", "3"])
 
     assert args.device == "cpu"
     assert args.folds == 3
+
+
+def test_parse_args_supports_blend_weights():
+    args = parse_args(["--blend-weights", "1.0,0.8,0.6"])
+
+    assert args.blend_weights == [1.0, 0.8, 0.6]
+
+
+def test_filter_training_outliers_removes_large_low_price_homes():
+    train = pd.DataFrame(
+        {
+            "Id": [1, 2, 3],
+            "GrLivArea": [1200, 4500, 4600],
+            "SalePrice": [140000, 250000, 650000],
+        }
+    )
+
+    filtered = filter_training_outliers(train)
+
+    assert filtered["Id"].tolist() == [1, 3]
+
+
+def test_build_error_analysis_sorts_by_absolute_log_error():
+    train = pd.DataFrame(
+        {
+            "Id": [1, 2],
+            "SalePrice": [100000, 200000],
+            "GrLivArea": [1200, 2000],
+            "TotalBsmtSF": [600, 900],
+            "1stFlrSF": [600, 900],
+            "2ndFlrSF": [0, 200],
+            "OverallQual": [5, 8],
+            "Neighborhood": ["NAmes", "NridgHt"],
+        }
+    )
+
+    report = build_error_analysis(train, [100000, 100000])
+
+    assert report.loc[0, "Id"] == 2
+    assert report.loc[0, "Prediction"] == 100000
+    assert report.loc[0, "AbsLogError"] > report.loc[1, "AbsLogError"]
+    assert "TotalSF" in report.columns
+
+
+def test_parse_args_supports_error_analysis_and_outlier_filter():
+    args = parse_args(
+        ["--error-analysis-output", "errors.csv", "--remove-outliers"]
+    )
+
+    assert args.error_analysis_output == Path("errors.csv")
+    assert args.remove_outliers is True
 
 
 def test_save_submission_writes_expected_kaggle_format(tmp_path: Path):
