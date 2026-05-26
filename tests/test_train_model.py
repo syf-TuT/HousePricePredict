@@ -2,7 +2,14 @@ from pathlib import Path
 
 import pandas as pd
 
-from train_model import FeatureEngineer, build_model, build_preprocessor, save_submission
+from train_model import (
+    FeatureEngineer,
+    build_model,
+    build_preprocessor,
+    build_xgb_model,
+    parse_args,
+    save_submission,
+)
 
 
 def test_feature_engineer_adds_house_price_domain_features():
@@ -25,6 +32,10 @@ def test_feature_engineer_adds_house_price_domain_features():
             "YrSold": [2008],
             "OverallQual": [7],
             "OverallCond": [5],
+            "PoolArea": [0],
+            "GarageArea": [548],
+            "Fireplaces": [1],
+            "TotRmsAbvGrd": [8],
             "MSSubClass": [60],
         }
     )
@@ -37,6 +48,13 @@ def test_feature_engineer_adds_house_price_domain_features():
     assert transformed.loc[0, "HouseAge"] == 5
     assert transformed.loc[0, "RemodAge"] == 5
     assert transformed.loc[0, "OverallScore"] == 35
+    assert transformed.loc[0, "IsRemodeled"] == 0
+    assert transformed.loc[0, "HasPool"] == 0
+    assert transformed.loc[0, "HasGarage"] == 1
+    assert transformed.loc[0, "HasBasement"] == 1
+    assert transformed.loc[0, "HasFireplace"] == 1
+    assert transformed.loc[0, "TotalRooms"] == 11
+    assert transformed.loc[0, "QualityArea"] == 17962
     assert transformed.loc[0, "MSSubClass"] == "60"
 
 
@@ -64,7 +82,14 @@ def test_preprocessor_handles_missing_numeric_and_categorical_values():
     assert transformed.shape[1] >= 3
 
 
-def test_build_model_uses_xgboost_cuda_regressor():
+def test_build_xgb_model_accepts_cpu_device():
+    model = build_xgb_model("cpu")
+
+    assert model.get_params()["device"] == "cpu"
+    assert model.get_params()["tree_method"] == "hist"
+
+
+def test_build_model_uses_requested_xgboost_device():
     train = pd.DataFrame(
         {
             "Id": [1, 2, 3, 4],
@@ -81,11 +106,18 @@ def test_build_model_uses_xgboost_cuda_regressor():
         }
     )
 
-    model = build_model(train, test)
+    model = build_model(train, test, device="cpu")
     xgb_model = model.regressor.named_steps["model"]
 
-    assert xgb_model.get_params()["device"] == "cuda"
+    assert xgb_model.get_params()["device"] == "cpu"
     assert xgb_model.get_params()["tree_method"] == "hist"
+
+
+def test_parse_args_supports_device_and_folds():
+    args = parse_args(["--device", "cpu", "--folds", "3"])
+
+    assert args.device == "cpu"
+    assert args.folds == 3
 
 
 def test_save_submission_writes_expected_kaggle_format(tmp_path: Path):

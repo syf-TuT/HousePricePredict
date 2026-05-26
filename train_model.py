@@ -1,6 +1,6 @@
 import argparse
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -12,6 +12,7 @@ from sklearn.model_selection import KFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from xgboost import XGBRegressor
+from xgboost.core import XGBoostError
 
 
 RANDOM_STATE = 42
@@ -43,6 +44,24 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
             data["RemodAge"] = (data["YrSold"] - data["YearRemodAdd"]).clip(lower=0)
         if {"OverallQual", "OverallCond"}.issubset(data.columns):
             data["OverallScore"] = data["OverallQual"] * data["OverallCond"]
+        if {"YearBuilt", "YearRemodAdd"}.issubset(data.columns):
+            data["IsRemodeled"] = (
+                data["YearBuilt"] != data["YearRemodAdd"]
+            ).astype(int)
+        if "PoolArea" in data.columns:
+            data["HasPool"] = (data["PoolArea"].fillna(0) > 0).astype(int)
+        if "GarageArea" in data.columns:
+            data["HasGarage"] = (data["GarageArea"].fillna(0) > 0).astype(int)
+        if "TotalBsmtSF" in data.columns:
+            data["HasBasement"] = (data["TotalBsmtSF"].fillna(0) > 0).astype(int)
+        if "Fireplaces" in data.columns:
+            data["HasFireplace"] = (data["Fireplaces"].fillna(0) > 0).astype(int)
+        if {"TotRmsAbvGrd", "FullBath", "HalfBath"}.issubset(data.columns):
+            data["TotalRooms"] = (
+                data["TotRmsAbvGrd"] + data["FullBath"] + data["HalfBath"]
+            )
+        if "OverallQual" in data.columns:
+            data["QualityArea"] = data["OverallQual"] * data["TotalSF"]
 
         for column in ["MSSubClass", "MoSold"]:
             if column in data.columns:
@@ -120,8 +139,8 @@ def build_preprocessor(train: pd.DataFrame, test: pd.DataFrame) -> Pipeline:
     )
 
 
-def build_model(train: pd.DataFrame, test: pd.DataFrame) -> TransformedTargetRegressor:
-    model = XGBRegressor(
+def build_xgb_model(device: str) -> XGBRegressor:
+    return XGBRegressor(
         objective="reg:squarederror",
         n_estimators=1800,
         learning_rate=0.025,
@@ -134,9 +153,16 @@ def build_model(train: pd.DataFrame, test: pd.DataFrame) -> TransformedTargetReg
         random_state=RANDOM_STATE,
         n_jobs=-1,
         tree_method="hist",
-        device="cuda",
+        device=device,
         eval_metric="rmse",
     )
+
+
+def build_model(
+    train: pd.DataFrame, test: pd.DataFrame, device: str = "auto"
+) -> TransformedTargetRegressor:
+    resolved_device = "cuda" if device == "auto" else device
+    model = build_xgb_model(resolved_device)
     regressor = Pipeline(
         steps=[
             ("preprocessor", build_preprocessor(train, test)),
@@ -148,6 +174,14 @@ def build_model(train: pd.DataFrame, test: pd.DataFrame) -> TransformedTargetReg
         func=np.log1p,
         inverse_func=np.expm1,
     )
+
+
+def use_cpu_model(
+    estimator: TransformedTargetRegressor,
+) -> TransformedTargetRegressor:
+    cpu_model = clone(estimator)
+    cpu_model.regressor.named_steps["model"].set_params(device="cpu")
+    return cpu_model
 
 
 def split_features_target(train: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
@@ -163,6 +197,7 @@ def cross_validate_rmsle(
     estimator: TransformedTargetRegressor,
     train: pd.DataFrame,
     folds: int = 5,
+    allow_cpu_fallback: bool = True,
 ) -> List[float]:
     x, y = split_features_target(train)
     cv = KFold(n_splits=folds, shuffle=True, random_state=RANDOM_STATE)
@@ -170,7 +205,13 @@ def cross_validate_rmsle(
 
     for train_index, validation_index in cv.split(x):
         fold_model = clone(estimator)
-        fold_model.fit(x.iloc[train_index], y.iloc[train_index])
+        try:
+            fold_model.fit(x.iloc[train_index], y.iloc[train_index])
+        except XGBoostError:
+            if not allow_cpu_fallback:
+                raise
+            fold_model = use_cpu_model(fold_model)
+            fold_model.fit(x.iloc[train_index], y.iloc[train_index])
         predictions = fold_model.predict(x.iloc[validation_index])
         scores.append(rmsle(y.iloc[validation_index], predictions))
 
@@ -191,12 +232,14 @@ def save_submission(
     output.to_csv(output_path, index=False)
 
 
-def train_and_predict(data_dir: Path, output_path: Path) -> None:
+def train_and_predict(
+    data_dir: Path, output_path: Path, device: str = "auto", folds: int = 5
+) -> None:
     train = pd.read_csv(data_dir / "train.csv")
     test = pd.read_csv(data_dir / "test.csv")
 
-    model = build_model(train, test)
-    scores = cross_validate_rmsle(model, train)
+    model = build_model(train, test, device=device)
+    scores = cross_validate_rmsle(model, train, folds=folds)
     print(
         "CV RMSLE: "
         f"{np.mean(scores):.5f} +/- {np.std(scores):.5f} "
@@ -204,13 +247,17 @@ def train_and_predict(data_dir: Path, output_path: Path) -> None:
     )
 
     x, y = split_features_target(train)
-    model.fit(x, y)
+    try:
+        model.fit(x, y)
+    except XGBoostError:
+        model = use_cpu_model(model)
+        model.fit(x, y)
     predictions = model.predict(test)
     save_submission(test, predictions, output_path)
     print(f"Wrote {output_path}")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train a Kaggle House Prices model and create submission.csv."
     )
@@ -226,9 +273,21 @@ def parse_args() -> argparse.Namespace:
         default=Path("submission.csv"),
         help="Path for the Kaggle submission CSV.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--device",
+        choices=["auto", "cuda", "cpu"],
+        default="auto",
+        help="XGBoost device. auto tries CUDA and falls back to CPU if needed.",
+    )
+    parser.add_argument(
+        "--folds",
+        type=int,
+        default=5,
+        help="Number of cross-validation folds.",
+    )
+    return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
     args = parse_args()
-    train_and_predict(args.data_dir, args.output)
+    train_and_predict(args.data_dir, args.output, device=args.device, folds=args.folds)
