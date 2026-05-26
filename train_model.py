@@ -82,6 +82,114 @@ class FeatureEngineer(BaseEstimator, TransformerMixin):
         return sum(values)
 
 
+class OutOfFoldTargetEncoder(BaseEstimator, TransformerMixin):
+    def __init__(
+        self,
+        internal_folds: int = 5,
+        smoothing: float = 10.0,
+        shuffle: bool = True,
+        random_state: int = RANDOM_STATE,
+    ) -> None:
+        self.internal_folds = internal_folds
+        self.smoothing = smoothing
+        self.shuffle = shuffle
+        self.random_state = random_state
+
+    def fit(
+        self, x: pd.DataFrame, y: Optional[pd.Series] = None
+    ) -> "OutOfFoldTargetEncoder":
+        if y is None:
+            raise ValueError("OutOfFoldTargetEncoder requires a target during fit.")
+
+        data = self._as_frame(x)
+        target = pd.Series(y, index=data.index, dtype=float)
+        self.columns_ = data.columns.tolist()
+        self.global_mean_ = float(target.mean())
+        self.category_maps_ = self._fit_category_maps(data, target)
+        return self
+
+    def fit_transform(
+        self, x: pd.DataFrame, y: Optional[pd.Series] = None, **fit_params: object
+    ) -> pd.DataFrame:
+        if y is None:
+            raise ValueError("OutOfFoldTargetEncoder requires a target during fit.")
+
+        data = self._as_frame(x)
+        target = pd.Series(y, index=data.index, dtype=float)
+        self.columns_ = data.columns.tolist()
+        self.global_mean_ = float(target.mean())
+        self.category_maps_ = self._fit_category_maps(data, target)
+
+        if len(data) < 2:
+            return self._encode_with_maps(data, self.category_maps_)
+
+        fold_count = min(self.internal_folds, len(data))
+        oof = pd.DataFrame(index=data.index)
+        for column in self.columns_:
+            oof[f"{column}_target_mean"] = self.global_mean_
+
+        cv = self._build_internal_cv(fold_count)
+        for train_index, validation_index in cv.split(data):
+            fold_maps = self._fit_category_maps(
+                data.iloc[train_index],
+                target.iloc[train_index],
+            )
+            encoded = self._encode_with_maps(data.iloc[validation_index], fold_maps)
+            oof.loc[data.index[validation_index], encoded.columns] = encoded.to_numpy()
+
+        return oof
+
+    def transform(self, x: pd.DataFrame) -> pd.DataFrame:
+        data = self._as_frame(x)
+        return self._encode_with_maps(data, self.category_maps_)
+
+    def _build_internal_cv(self, fold_count: int) -> KFold:
+        if self.shuffle:
+            return KFold(
+                n_splits=fold_count,
+                shuffle=True,
+                random_state=self.random_state,
+            )
+        return KFold(n_splits=fold_count, shuffle=False)
+
+    def _fit_category_maps(
+        self, data: pd.DataFrame, target: pd.Series
+    ) -> Dict[str, pd.Series]:
+        category_maps = {}
+        for column in self.columns_:
+            grouped = target.groupby(self._normalize_column(data[column])).agg(
+                ["sum", "count"]
+            )
+            category_maps[column] = (
+                (grouped["sum"] + self.global_mean_ * self.smoothing)
+                / (grouped["count"] + self.smoothing)
+            )
+        return category_maps
+
+    def _encode_with_maps(
+        self, data: pd.DataFrame, category_maps: Dict[str, pd.Series]
+    ) -> pd.DataFrame:
+        encoded = pd.DataFrame(index=data.index)
+        for column in self.columns_:
+            encoded[f"{column}_target_mean"] = (
+                self._normalize_column(data[column])
+                .map(category_maps[column])
+                .fillna(self.global_mean_)
+                .astype(float)
+            )
+        return encoded
+
+    @staticmethod
+    def _as_frame(x: pd.DataFrame) -> pd.DataFrame:
+        if isinstance(x, pd.DataFrame):
+            return x.copy()
+        return pd.DataFrame(x)
+
+    @staticmethod
+    def _normalize_column(values: pd.Series) -> pd.Series:
+        return values.astype("string").fillna("__MISSING__")
+
+
 def feature_columns(train: pd.DataFrame, test: pd.DataFrame) -> Tuple[List[str], List[str]]:
     combined = pd.concat(
         [
@@ -123,11 +231,15 @@ def build_preprocessor(train: pd.DataFrame, test: pd.DataFrame) -> Pipeline:
             ),
         ]
     )
-
     column_transformer = ColumnTransformer(
         transformers=[
             ("numeric", numeric_pipeline, numeric_features),
             ("categorical", categorical_pipeline, categorical_features),
+            (
+                "target_categorical",
+                OutOfFoldTargetEncoder(),
+                categorical_features,
+            ),
         ],
         remainder="drop",
     )

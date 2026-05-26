@@ -1,9 +1,11 @@
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from train_model import (
     FeatureEngineer,
+    OutOfFoldTargetEncoder,
     blend_predictions,
     build_error_analysis,
     build_model,
@@ -80,10 +82,51 @@ def test_preprocessor_handles_missing_numeric_and_categorical_values():
     )
 
     preprocessor = build_preprocessor(train, test)
-    transformed = preprocessor.fit_transform(train.drop(columns=["SalePrice"]))
+    transformed = preprocessor.fit_transform(
+        train.drop(columns=["SalePrice"]),
+        train["SalePrice"],
+    )
 
     assert transformed.shape[0] == len(train)
     assert transformed.shape[1] >= 3
+
+
+def test_out_of_fold_target_encoder_uses_fold_only_category_means():
+    data = pd.DataFrame({"Neighborhood": ["A", "A", "A", "B", "B", "B"]})
+    target = pd.Series([10.0, 20.0, 30.0, 100.0, 110.0, 120.0])
+
+    encoder = OutOfFoldTargetEncoder(
+        internal_folds=3,
+        smoothing=0.0,
+        shuffle=False,
+    )
+    transformed = encoder.fit_transform(data, target)
+
+    assert transformed["Neighborhood_target_mean"].tolist() == [
+        30.0,
+        30.0,
+        15.0,
+        115.0,
+        100.0,
+        100.0,
+    ]
+
+
+def test_out_of_fold_target_encoder_uses_global_mean_for_unknown_categories():
+    train = pd.DataFrame({"Neighborhood": ["A", "A", "B"]})
+    target = pd.Series([10.0, 20.0, 100.0])
+    validation = pd.DataFrame({"Neighborhood": ["A", "C", None]})
+
+    encoder = OutOfFoldTargetEncoder(internal_folds=2, smoothing=0.0).fit(
+        train, target
+    )
+    transformed = encoder.transform(validation)
+
+    assert transformed["Neighborhood_target_mean"].tolist() == [
+        15.0,
+        np.mean(target),
+        np.mean(target),
+    ]
 
 
 def test_build_xgb_model_accepts_cpu_device():
