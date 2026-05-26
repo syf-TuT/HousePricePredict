@@ -6,18 +6,12 @@ import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.compose import ColumnTransformer, TransformedTargetRegressor
-from sklearn.ensemble import (
-    ExtraTreesRegressor,
-    GradientBoostingRegressor,
-    HistGradientBoostingRegressor,
-    RandomForestRegressor,
-    VotingRegressor,
-)
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import mean_squared_log_error
 from sklearn.model_selection import KFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from xgboost import XGBRegressor
 
 
 RANDOM_STATE = 42
@@ -127,52 +121,21 @@ def build_preprocessor(train: pd.DataFrame, test: pd.DataFrame) -> Pipeline:
 
 
 def build_model(train: pd.DataFrame, test: pd.DataFrame) -> TransformedTargetRegressor:
-    model = VotingRegressor(
-        estimators=[
-            (
-                "gbr",
-                GradientBoostingRegressor(
-                    n_estimators=900,
-                    learning_rate=0.035,
-                    max_depth=3,
-                    min_samples_leaf=3,
-                    subsample=0.85,
-                    random_state=RANDOM_STATE,
-                ),
-            ),
-            (
-                "hgb",
-                HistGradientBoostingRegressor(
-                    learning_rate=0.035,
-                    max_iter=650,
-                    max_leaf_nodes=31,
-                    l2_regularization=0.02,
-                    random_state=RANDOM_STATE,
-                ),
-            ),
-            (
-                "extra",
-                ExtraTreesRegressor(
-                    n_estimators=700,
-                    min_samples_leaf=2,
-                    max_features=0.55,
-                    random_state=RANDOM_STATE,
-                    n_jobs=-1,
-                ),
-            ),
-            (
-                "rf",
-                RandomForestRegressor(
-                    n_estimators=500,
-                    min_samples_leaf=2,
-                    max_features=0.45,
-                    random_state=RANDOM_STATE,
-                    n_jobs=-1,
-                ),
-            ),
-        ],
-        weights=[0.45, 0.2, 0.25, 0.1],
+    model = XGBRegressor(
+        objective="reg:squarederror",
+        n_estimators=1800,
+        learning_rate=0.025,
+        max_depth=3,
+        min_child_weight=1.5,
+        subsample=0.85,
+        colsample_bytree=0.65,
+        reg_alpha=0.001,
+        reg_lambda=2.0,
+        random_state=RANDOM_STATE,
         n_jobs=-1,
+        tree_method="hist",
+        device="cuda",
+        eval_metric="rmse",
     )
     regressor = Pipeline(
         steps=[

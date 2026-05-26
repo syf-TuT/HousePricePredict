@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from train_model import FeatureEngineer, build_preprocessor, save_submission
+from train_model import FeatureEngineer, build_model, build_preprocessor, save_submission
 
 
 def test_feature_engineer_adds_house_price_domain_features():
@@ -62,6 +62,30 @@ def test_preprocessor_handles_missing_numeric_and_categorical_values():
 
     assert transformed.shape[0] == len(train)
     assert transformed.shape[1] >= 3
+
+
+def test_build_model_uses_xgboost_cuda_regressor():
+    train = pd.DataFrame(
+        {
+            "Id": [1, 2, 3, 4],
+            "LotArea": [8450, 9600, 11250, 9550],
+            "MSZoning": ["RL", "RL", "RM", "FV"],
+            "SalePrice": [208500, 181500, 223500, 140000],
+        }
+    )
+    test = pd.DataFrame(
+        {
+            "Id": [5],
+            "LotArea": [10000],
+            "MSZoning": ["RL"],
+        }
+    )
+
+    model = build_model(train, test)
+    xgb_model = model.regressor.named_steps["model"]
+
+    assert xgb_model.get_params()["device"] == "cuda"
+    assert xgb_model.get_params()["tree_method"] == "hist"
 
 
 def test_save_submission_writes_expected_kaggle_format(tmp_path: Path):
